@@ -1,0 +1,10 @@
+streamlit
+torch
+torchvision
+transformers
+opencv-python
+Pillow
+pandas
+plotly
+soundfile
+openai-whisper

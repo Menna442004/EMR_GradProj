@@ -1,0 +1,14 @@
+# Model weights — too large for GitHub
+*.pth
+*.pt
+*.bin
+model_only/
+whisper_cache/
+
+# Database — contains patient data
+*.db
+
+# Python cache
+__pycache__/
+*.pyc
+.env
