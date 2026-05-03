@@ -1,3 +1,8 @@
+import os
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+os.environ["TF_CPP_MIN_LOG_LEVEL"]  = "3"
+os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+os.environ["TOKENIZERS_PARALLELISM"]  = "false"
 import streamlit as st
 import sqlite3
 import pandas as pd
@@ -9,17 +14,20 @@ import json
 import soundfile as sf
 import numpy as np
 import whisper
-import os
 import torchvision.transforms as T
 import torch
 from PIL import Image
 from datetime import datetime
+import os
 
 from model import (
     predict, predict_topk,                          # NLP
     load_vision_engine, GradCAM,                    # Vision
     apply_clahe, encode_meta,                       # Vision helpers
     DEVICE, DISEASE_LABELS, OPTIMAL_THRESHOLDS,     # Vision constants
+    load_gi_engine, predict_gi,                     # GI model
+    gradcam_gi, overlay_gi_gradcam,                 # GI Grad-CAM
+    GI_CLASS_NAMES,                                 # GI constants
 )
 
 # ── Config ─────────────────────────────────────────────────────────────────────
@@ -72,7 +80,7 @@ div.stButton > button:hover { background: #1d4ed8; }
 """, unsafe_allow_html=True)
 
 DB_PATH      = "patient_database.db"
-WHISPER_CACHE = r"C:\Users\RofaR\OneDrive\Desktop\ManarGP\whisper_cache"
+WHISPER_CACHE = r"E:\SehaTrack2\whisper_cache-20260503T102659Z-3-001\whisper_cache"
 os.makedirs(WHISPER_CACHE, exist_ok=True)
 
 # Val transform — must match notebook val_transform exactly
@@ -162,6 +170,22 @@ def init_db():
         all_findings    TEXT,
         doctor_notes    TEXT,
         processed_at    TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS gi_scans (
+        scan_id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        patient_id       TEXT,
+        patient_name     TEXT,
+        doctor_id        INTEGER,
+        scan_datetime    TEXT,
+        patient_age      INTEGER,
+        patient_gender   TEXT,
+        predicted_class  TEXT,
+        confidence       REAL,
+        risk_level       TEXT,
+        all_findings     TEXT,
+        doctor_notes     TEXT,
+        processed_at     TEXT
     );
     """)
 
@@ -369,6 +393,45 @@ def get_all_xray_scans():
     con.close()
     return df
 
+# ── GI DB helpers ────────────────────────────────────────────────────────────────
+def save_gi_scan(patient_id, patient_name, doctor_id,
+                 age, gender, predicted_class, confidence,
+                 risk_level, all_probs, notes=""):
+    # save to db — same pattern as save_xray_scan
+    con = sqlite3.connect(DB_PATH)
+    con.execute("""
+        INSERT INTO gi_scans
+            (patient_id, patient_name, doctor_id, scan_datetime,
+             patient_age, patient_gender,
+             predicted_class, confidence, risk_level,
+             all_findings, doctor_notes, processed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        patient_id, patient_name, doctor_id,
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        age, gender,
+        predicted_class, confidence, risk_level,
+        json.dumps(all_probs),
+        notes, datetime.now().isoformat()
+    ))
+    con.commit()
+    con.close()
+
+def get_all_gi_scans():
+    con = sqlite3.connect(DB_PATH)
+    df  = pd.read_sql_query("""
+        SELECT g.scan_id, g.scan_datetime, g.patient_name,
+               g.patient_age, g.patient_gender,
+               g.predicted_class, g.confidence, g.risk_level,
+               g.all_findings, g.doctor_notes,
+               d.full_name AS doctor_name
+        FROM gi_scans g
+        LEFT JOIN doctors d ON g.doctor_id = d.doctor_id
+        ORDER BY g.scan_datetime DESC
+    """, con)
+    con.close()
+    return df
+
 # ── Whisper ─────────────────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
 def load_whisper():
@@ -392,6 +455,14 @@ def load_xray_engine():
     return vision, cam
 
 vision_eng, gradcam_eng = load_xray_engine()
+
+
+#     
+@st.cache_resource(show_spinner="Loading GI AI engine…")   # ← ADD HERE
+def load_gi_engine_cached():
+    return load_gi_engine()
+
+
 
 # ── Session state init ──────────────────────────────────────────────────────────
 if "doctor" not in st.session_state:
@@ -463,6 +534,8 @@ with st.sidebar:
         "👤 Patient Search",
         "🫁 X-Ray Dashboard",
         "🫁 X-Ray Logs",
+        "🔬 GI Analysis",
+        "🔬 GI Logs",
     ])
     st.markdown("---")
     if st.button("🚪 Log Out"):
@@ -792,6 +865,7 @@ if page == "🩺 Diagnostic Lab":
                 })
                 bar_colors = ["#ef4444" if r == "Yes" else "#93c5fd"
                               for r in prob_df["Detected"]]
+
                 fig_xray = go.Figure(go.Bar(
                     x=prob_df["Probability"],
                     y=prob_df["Disease"],
@@ -812,7 +886,7 @@ if page == "🩺 Diagnostic Lab":
             # ── Save scan to DB ────────────────────────────────────────────
             pid_for_scan  = st.session_state.get("last_patient_id", None)
             # Always use the explicitly entered name — never guess
-            name_for_scan = xray_patient_name.strip() or "Unknown" 
+            name_for_scan = xray_patient_name.strip() or "Unknown"
             probs_dict    = {DISEASE_LABELS[i]: round(float(probs[i]), 4)
                              for i in range(14)}
             save_xray_scan(
@@ -1173,3 +1247,215 @@ elif page == "🫁 X-Ray Logs":
     # ── Export ────────────────────────────────────────────────────────────────
     csv = filtered.to_csv(index=False).encode("utf-8")
     st.download_button("⬇️ Export X-Ray Logs CSV", csv, "xray_logs.csv", "text/csv")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE 7 — GI Analysis
+# ══════════════════════════════════════════════════════════════════════════════
+elif page == "🔬 GI Analysis":
+    gi_eng = load_gi_engine_cached()   # ← loads here, cached after first time
+
+    if gi_eng is None:
+        st.error("GI model not loaded. Place gi_model.keras in the working directory.")
+        st.stop()
+
+    with st.container():
+        _default_name = st.session_state.get("last_patient_name", "")
+        gi_patient_name = st.text_input(
+            "Patient name *",
+            value=_default_name,
+            placeholder="e.g. Ahmed Khalil",
+            key="gi_patient_name_input",
+        )
+
+        gi1, gi2, gi3 = st.columns(3)
+        with gi1:
+            gi_age    = st.number_input("Patient age *", min_value=1, max_value=100,
+                                        value=40, step=1, key="gi_age_input")
+        with gi2:
+            gi_gender = st.selectbox("Gender *", ["Male", "Female"], key="gi_gender_input")
+        with gi3:
+            gi_notes  = st.text_input("GI notes (optional)",
+                                      placeholder="e.g. colonoscopy, upper endoscopy")
+
+        gi_file = st.file_uploader("Upload endoscopy image", type=["png", "jpg", "jpeg"],
+                                   key="gi_uploader")
+
+    if gi_file:
+        col_orig, col_res = st.columns([1, 1.6], gap="large")
+
+        with col_orig:
+            gi_pil = Image.open(gi_file).convert("RGB")
+            st.image(gi_pil, caption="Uploaded Image", use_container_width=True)
+
+        if st.button("🔬 Run GI Analysis", key="btn_gi"):
+            with st.spinner("Running EfficientNetB1 inference…"):
+                # predict
+                result = predict_gi(gi_pil, gi_eng)
+
+            pred_label  = result["label"]
+            confidence  = result["confidence"]
+            risk        = result["risk"]
+            all_probs   = result["all_probs"]
+
+            with col_res:
+                # ── Metrics ────────────────────────────────────────────────
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Prediction",  pred_label)
+                m2.metric("Confidence",  f"{confidence:.1%}")
+                m3.metric("Risk Level",  risk)
+
+                # ── Risk banner ────────────────────────────────────────────
+                risk_colors = {"High": "xray-positive", "Medium": "xray-positive", "Low": "xray-negative"}
+                risk_icons  = {"High": "🔴", "Medium": "🟡", "Low": "🟢"}
+                st.markdown(
+                    f'<div class="{risk_colors[risk]}">'
+                    f'{risk_icons[risk]} Risk Level: <strong>{risk}</strong> — {pred_label}'
+                    f'</div>',
+                    unsafe_allow_html=True
+                )
+
+                # ── Grad-CAM ───────────────────────────────────────────────
+                st.markdown("**Grad-CAM — Model Attention**")
+                try:
+                    heatmap     = gradcam_gi(gi_pil, gi_eng)
+                    overlay_img = overlay_gi_gradcam(gi_pil, heatmap, alpha=0.4)
+                    st.image(overlay_img,
+                             caption=f"Attention map for: {pred_label}",
+                             use_container_width=True)
+                    st.caption("Red/yellow = regions that most influenced the prediction.")
+                except Exception as e:
+                    st.warning(f"Grad-CAM error: {e}")
+
+                # ── Probability bar chart ──────────────────────────────────
+                st.markdown("**All Class Probabilities**")
+                sorted_probs = sorted(all_probs.items(), key=lambda x: x[1], reverse=True)
+                prob_df = pd.DataFrame(sorted_probs, columns=["Class", "Probability"])
+                prob_df["Probability_pct"] = (prob_df["Probability"] * 100).round(2)
+                bar_colors = ["#ef4444" if c == pred_label else "#93c5fd"
+                              for c in prob_df["Class"]]
+
+                fig_gi = go.Figure(go.Bar(
+                    x=prob_df["Probability_pct"],
+                    y=prob_df["Class"],
+                    orientation="h",
+                    marker_color=bar_colors,
+                    text=prob_df["Probability_pct"].apply(lambda v: f"{v:.1f}%"),
+                    textposition="outside",
+                ))
+                fig_gi.update_layout(
+                    xaxis=dict(title="Probability (%)", range=[0, max(prob_df["Probability_pct"]) * 1.2]),
+                    yaxis=dict(autorange="reversed"),
+                    height=360,
+                    margin=dict(l=10, r=50, t=10, b=30),
+                    plot_bgcolor="white",
+                )
+                st.plotly_chart(fig_gi, use_container_width=True)
+
+            # ── Save scan to DB ────────────────────────────────────────────
+            pid_for_scan  = st.session_state.get("last_patient_id", None)
+            name_for_scan = gi_patient_name.strip() or "Unknown"
+            save_gi_scan(
+                patient_id=pid_for_scan, patient_name=name_for_scan,
+                doctor_id=doc["id"],
+                age=gi_age, gender=gi_gender,
+                predicted_class=pred_label, confidence=confidence,
+                risk_level=risk, all_probs=all_probs,
+                notes=gi_notes,
+            )
+            st.success("✅ GI scan saved to Clinical Logs.")
+
+            # ── CSV download ───────────────────────────────────────────────
+            csv = prob_df.to_csv(index=False).encode()
+            st.download_button("⬇️ Download results CSV", csv,
+                               "gi_results.csv", "text/csv")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE 8 — GI Logs
+# ══════════════════════════════════════════════════════════════════════════════
+elif page == "🔬 GI Logs":
+    st.header("🔬 GI Scan Logs")
+
+    df = get_all_gi_scans()
+    if df.empty:
+        st.warning("No GI scans recorded yet.")
+        st.stop()
+
+    df["scan_datetime"] = pd.to_datetime(df["scan_datetime"])
+
+    # ── Filters ───────────────────────────────────────────────────────────────
+    f1, f2, f3 = st.columns(3)
+    with f1:
+        class_filter = st.multiselect(
+            "Predicted Class",
+            df["predicted_class"].dropna().unique().tolist(),
+            default=df["predicted_class"].dropna().unique().tolist()
+        )
+    with f2:
+        risk_filter = st.multiselect(
+            "Risk Level",
+            df["risk_level"].dropna().unique().tolist(),
+            default=df["risk_level"].dropna().unique().tolist()
+        )
+    with f3:
+        gi_date_range = st.date_input(
+            "Date range",
+            [df["scan_datetime"].min().date(), df["scan_datetime"].max().date()],
+            key="gi_log_dates"
+        )
+
+    filtered = df[
+        df["predicted_class"].isin(class_filter) &
+        df["risk_level"].isin(risk_filter) &
+        (df["scan_datetime"].dt.date >= gi_date_range[0]) &
+        (df["scan_datetime"].dt.date <= gi_date_range[1])
+    ] if len(gi_date_range) == 2 else df
+
+    st.caption(f"Showing {len(filtered)} of {len(df)} records")
+
+    # ── Main table ────────────────────────────────────────────────────────────
+    display_df = filtered[[
+        "scan_datetime", "patient_name", "patient_age", "patient_gender",
+        "predicted_class", "confidence", "risk_level",
+        "doctor_name", "doctor_notes"
+    ]].copy()
+    display_df.columns = [
+        "Date", "Patient", "Age", "Gender",
+        "Predicted Class", "Confidence", "Risk Level",
+        "Doctor", "Notes"
+    ]
+    display_df["Confidence"] = display_df["Confidence"].apply(
+        lambda v: f"{v:.1%}" if pd.notna(v) else ""
+    )
+    st.dataframe(display_df, use_container_width=True)
+
+    # ── Expandable per-scan detail ────────────────────────────────────────────
+    st.markdown("#### Detailed Scan View")
+    for _, row in filtered.head(20).iterrows():
+        with st.expander(
+            f"🔬 {row['patient_name']}  ·  {row['scan_datetime'].strftime('%Y-%m-%d %H:%M')}  "
+            f"·  {row['predicted_class']} ({row['confidence']:.1%}) — Risk: {row['risk_level']}"
+        ):
+            d1, d2 = st.columns(2)
+            with d1:
+                st.write(f"**Age:** {row['patient_age']}  |  **Gender:** {row['patient_gender']}")
+                st.write(f"**Doctor:** {row['doctor_name'] or '—'}")
+                if row["doctor_notes"]:
+                    st.write(f"**Notes:** {row['doctor_notes']}")
+            with d2:
+                if pd.notna(row["all_findings"]) and row["all_findings"]:
+                    try:
+                        findings = json.loads(row["all_findings"])
+                        mini_df  = pd.DataFrame(
+                            sorted(findings.items(), key=lambda x: x[1], reverse=True),
+                            columns=["Class", "Probability"]
+                        )
+                        mini_df["Probability"] = mini_df["Probability"].apply(lambda v: f"{v:.1%}")
+                        st.dataframe(mini_df, use_container_width=True, hide_index=True)
+                    except Exception:
+                        st.caption("Findings data unavailable.")
+
+    # ── Export ────────────────────────────────────────────────────────────────
+    csv = filtered.to_csv(index=False).encode("utf-8")
+    st.download_button("⬇️ Export GI Logs CSV", csv, "gi_logs.csv", "text/csv")
