@@ -1459,3 +1459,4 @@ elif page == "🔬 GI Logs":
     # ── Export ────────────────────────────────────────────────────────────────
     csv = filtered.to_csv(index=False).encode("utf-8")
     st.download_button("⬇️ Export GI Logs CSV", csv, "gi_logs.csv", "text/csv")
+    ##
