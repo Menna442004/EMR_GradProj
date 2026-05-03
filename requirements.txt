@@ -8,3 +8,4 @@ pandas
 plotly
 soundfile
 openai-whisper
+tensorflow
