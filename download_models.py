@@ -20,7 +20,7 @@ HOW TO USE:
 import os
 import streamlit as st
 
-HF_REPO  = os.environ.get("HF_REPO",  "Menna442004/sehatrack-weights")
+HF_REPO  = os.environ.get("HF_REPO",  "ROFARAMADAN//sehatrack-weights")
 HF_TOKEN = os.environ.get("HF_TOKEN", None)
 
 FILES_NEEDED = [

@@ -46,9 +46,16 @@ except ImportError:
 # ══════════════════════════════════════════════════════════════════════════════
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
-NLP_MODEL_PATH   = os.path.join(_HERE, "model_only")
-VISION_WEIGHTS   = os.path.join(_HERE, "best_chexnet_multimodal.pth")
-KVASIR_MODEL_PATH = os.path.join(_HERE, "gi_model_clean.h5")
+import os
+
+import os
+
+_BASE = os.path.dirname(os.path.abspath(__file__))
+
+# Fixed the file name back to .pth
+VISION_WEIGHTS    = os.path.join(_BASE, "best_chexnet_multimodal.pth")
+KVASIR_MODEL_PATH = os.path.join(_BASE, "gi_model_clean.h5")
+NLP_MODEL_PATH    = os.path.join(_BASE, "model_only")
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DEVICE = device
@@ -106,8 +113,21 @@ def _load_nlp():
         return None, None
 
 
-_tokenizer, _nlp_model = _load_nlp()
+import streamlit as st
 
+@st.cache_resource
+def get_nlp_model():
+    return _load_nlp()
+
+def _get_probs(text: str) -> torch.Tensor:
+    tok, mdl = get_nlp_model() # Lazy load here!
+    
+    inputs = tok(text, return_tensors="pt", truncation=True, max_length=512)
+    inputs.pop("token_type_ids", None)
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    with torch.no_grad():
+        logits = mdl(**inputs).logits
+    return F.softmax(logits, dim=1)[0]
 
 def _get_probs(text: str) -> torch.Tensor:
     inputs = _tokenizer(text, return_tensors="pt", truncation=True, max_length=512)

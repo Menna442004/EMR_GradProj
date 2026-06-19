@@ -12,7 +12,9 @@
 
 
 # ── Core web framework ─────────────────────────────────────────────────────
-streamlit==1.35.0
+streamlit==1.41.0
+huggingface-hub==0.23.0
+openai-whisper==20231117
 
 # ── PyTorch (CPU-only, much smaller — no CUDA needed on free tiers) ─────────
 torch==2.2.2+cpu

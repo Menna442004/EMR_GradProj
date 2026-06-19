@@ -1,24 +1,8 @@
 """
 app.py — SehaTrack Pro
-Unified Streamlit application combining:
-  • Doctor auth + patient login portal
-  • Patient registration workflow
-  • AI-powered NLP symptom triage (voice + text)
-  • CheXNet chest X-ray analysis with Grad-CAM++ heatmaps
-  • Kvasir GI endoscopy analysis with LIME explainability
-  • Secure tele-chat between doctor and patient
-  • Prescriptions management (doctor adds, patient views)
-  • Appointment booking (patient requests, doctor confirms/rejects)
-  • Follow-up reminders for patients
-  • Clinical insights dashboard
-  • Clinical logs with CSV export
-  • Patient search
 """
 import hashlib
 import io
-
-
-
 import json
 import os
 import sqlite3
@@ -26,20 +10,63 @@ import tempfile
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
+import streamlit as st
+from huggingface_hub import hf_hub_download, snapshot_download
+import whisper
+
+# 1. Page Config MUST be the first Streamlit command
+st.set_page_config(page_title="SehaTrack Pro", layout="wide", page_icon="🏥")
+
+# 2. Cache Whisper model to avoid memory overload
+@st.cache_resource
+def load_whisper():
+    return whisper.load_model("tiny")
+
+# 3. Safely download weights
+@st.cache_data(show_spinner="📥 Downloading model weights (first run only)…")
+def _download_weights():
+    token = os.environ.get("HF_TOKEN")
+    repo  = os.environ.get("HF_REPO", "ROFARAMADAN/sehatrack-weights")
+    base  = "/app" # CRITICAL: This was missing!
+    
+    # Download individual files (Fixed filename)
+    for fname in ["best_chexnet_multimodal.pth", "gi_model_clean.h5"]:
+        if not os.path.isfile(os.path.join(base, fname)):
+            hf_hub_download(
+                repo_id=repo, 
+                filename=fname,
+                repo_type="dataset", 
+                token=token,
+                local_dir=base
+            )
+            
+    # Download NLP folder
+    if not os.path.isdir(os.path.join(base, "model_only")):
+        snapshot_download(
+            repo_id=repo, 
+            repo_type="dataset",
+            token=token, 
+            local_dir=base,
+            allow_patterns="model_only/*"
+        )
+
+# Execute the download
+_download_weights()
+
+# Remaining imports...
 import cv2
 import numpy as np
 import pandas as pd
-import streamlit as st  # line 33
 import torch
 import plotly.express as px
 import plotly.graph_objects as go
 import soundfile as sf
 import torchvision.transforms as T
-import whisper
 from PIL import Image
 
-from download_models import download_all_weights
-download_all_weights()   
+# ... rest of your code ...
+
+   
 
 
 
@@ -597,7 +624,7 @@ def get_patient_followups(patient_id: str) -> pd.DataFrame:
 @st.cache_resource(show_spinner=False)
 def _load_whisper():
     try:
-        return whisper.load_model("small")
+        return whisper.load_model("base")
     except Exception:
         return None
 
@@ -1364,7 +1391,7 @@ elif page == "🩻 Imaging Analysis":
 
         if "Chest" in analysis_type:
             if vision_model is None:
-                st.error("CheXNet model not available. Place best_chexnet_multimodal.pth next to app.py.")
+                st.error("CheXNet model not available. Place chexnet.h5 next to app.py.")
                 st.stop()
 
             with st.spinner("Running CheXNet multimodal inference + Grad-CAM++…"):
