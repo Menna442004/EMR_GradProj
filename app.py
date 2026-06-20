@@ -532,10 +532,15 @@ def get_patient_followups(patient_id: str) -> pd.DataFrame:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MODEL LOADING (cached)
+# MODEL LOADING — cached + LAZY.
+# Each model is only loaded into memory the first time the feature that needs
+# it is actually used (not at startup), so a fresh container never has to hold
+# Whisper + the vision model + the Kvasir model in RAM all at once just to
+# render the login screen. st.cache_resource still ensures each one is only
+# ever loaded once per process and reused after that.
 # ══════════════════════════════════════════════════════════════════════════════
 @st.cache_resource(show_spinner=False)
-def _load_whisper():
+def get_whisper():
     try:
         return whisper.load_model("small")
     except Exception:
@@ -543,7 +548,7 @@ def _load_whisper():
 
 
 @st.cache_resource(show_spinner=False)
-def _load_vision():
+def get_vision():
     try:
         return load_vision_engine()
     except Exception:
@@ -551,17 +556,23 @@ def _load_vision():
 
 
 @st.cache_resource(show_spinner=False)
-def _load_kvasir():
+def get_kvasir():
     try:
         return load_kvasir_engine()
     except Exception:
         return None
 
 
-whisper_model  = _load_whisper()
-vision_model   = _load_vision()
-gradcam_engine = GradCAMPlusPlus(vision_model) if vision_model is not None else None
-kvasir_model   = _load_kvasir()
+_gradcam_engine = None
+
+
+def get_gradcam():
+    """Lazily builds the Grad-CAM++ wrapper around the (lazily loaded) vision model."""
+    global _gradcam_engine
+    if _gradcam_engine is None:
+        vmodel = get_vision()
+        _gradcam_engine = GradCAMPlusPlus(vmodel) if vmodel is not None else None
+    return _gradcam_engine
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -571,12 +582,13 @@ def audio_to_text(audio_file) -> Tuple[str, float]:
     audio_bytes = audio_file.read()
     data, sr    = sf.read(io.BytesIO(audio_bytes))
     data        = np.asarray(data, dtype=np.float32)
-    result      = whisper_model.transcribe(data, fp16=False)
+    result      = get_whisper().transcribe(data, fp16=False)
     return result["text"], len(data) / sr
 
 
 def transcribe_file_whisper(audio_file) -> Optional[str]:
-    if whisper_model is None:
+    wmodel = get_whisper()
+    if wmodel is None:
         return None
     try:
         audio_bytes = (
@@ -590,7 +602,7 @@ def transcribe_file_whisper(audio_file) -> Optional[str]:
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
             tmp.write(audio_bytes)
             tmp_path = tmp.name
-        result = whisper_model.transcribe(tmp_path)
+        result = wmodel.transcribe(tmp_path)
         os.unlink(tmp_path)
         return str(result.get("text", "")).strip()
     except Exception:
@@ -1136,7 +1148,7 @@ if page == "🩺 Diagnostic Lab":
                 transcription   = text_to_analyze
 
             try:
-                predictions = predict_topk(text_to_analyze)
+                predictions = predict_topk(text_to_analyze, k=5)
             except Exception as e:
                 st.error(f"Model prediction failed: {e}")
                 st.stop()
@@ -1303,7 +1315,8 @@ elif page == "🩻 Imaging Analysis":
         img = Image.open(doc_upload).convert("RGB")
 
         if "Chest" in analysis_type:
-            if vision_model is None:
+            vmodel = get_vision()
+            if vmodel is None:
                 st.error("CheXNet model not available. Place best_chexnet_multimodal.pth next to app.py.")
                 st.stop()
 
@@ -1314,7 +1327,7 @@ elif page == "🩻 Imaging Analysis":
                 meta_tensor = encode_meta(p_age, p_gender, "PA/AP").to(DEVICE)
 
                 with torch.no_grad():
-                    logits = vision_model(img_tensor, meta_tensor)
+                    logits = vmodel(img_tensor, meta_tensor)
                     preds  = torch.sigmoid(logits).squeeze(0).detach().cpu().numpy()
 
                 res_map        = {DISEASE_LABELS[i]: float(preds[i]) for i in range(min(len(DISEASE_LABELS), len(preds)))}
@@ -1327,10 +1340,11 @@ elif page == "🩻 Imaging Analysis":
 
             st.success(f"**Detected:** {primary_dx}")
 
-            if gradcam_engine is not None:
+            gcam = get_gradcam()
+            if gcam is not None:
                 try:
                     target_idx = int(np.argmax(preds))
-                    heatmap    = gradcam_engine.generate(img_tensor, meta_tensor, target_idx)
+                    heatmap    = gcam.generate(img_tensor, meta_tensor, target_idx)
                     col1, col2 = st.columns(2)
                     with col1:
                         st.image(img, caption="Original X-Ray", use_container_width=True)
@@ -1372,13 +1386,14 @@ elif page == "🩻 Imaging Analysis":
             st.caption("Record saved to medical history.")
 
         else:
-            if kvasir_model is None or not _TF_AVAILABLE:
+            kmodel = get_kvasir()
+            if kmodel is None or not _TF_AVAILABLE:
                 st.error("Kvasir model not available. Place gi_model_clean.h5 next to app.py.")
                 st.stop()
 
             with st.spinner("Running Kvasir GI inference + LIME explanation…"):
                 class_name, confidence, chart_data, lime_img = run_kvasir_lime_explanation(
-                    img, kvasir_model, num_samples=500
+                    img, kmodel, num_samples=500
                 )
 
             st.success(f"**Finding:** {friendly_label(class_name)} ({confidence:.1%} confidence)")
@@ -1524,7 +1539,10 @@ elif page == "📊 Insights Hub":
         st.warning("No visit data yet. Run some diagnoses first.")
         st.stop()
 
-    df["visit_datetime"] = pd.to_datetime(df["visit_datetime"])
+    df["visit_datetime"] = pd.to_datetime(
+    df["visit_datetime"],
+    errors="coerce"
+)
 
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Total Patients",    df["patient_id"].nunique())
@@ -1735,3 +1753,6 @@ elif page == "👤 Patient Search":
                             )
                     else:
                         st.caption("No imaging records.")
+                        
+                        
+                   
