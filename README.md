@@ -257,24 +257,24 @@ The application can be deployed using Streamlit Community Cloud:
 
 ## Login Page
 
-![Login Page](screenshots/log-in.png)
+![Login Page](Screenshots/Log-in.png)
 
 ## Chest X-Ray Analysis
 
-![X-Ray Prediction](screenshots/xray_results.png)
+![X-Ray Prediction](Screenshots/xray-results.png)
 
 ## GI Analysis
 
-![GI Prediction](screenshots/Gi_result.png)
+![GI Prediction](Screenshots/Gi-results.png)
 
 ## Speech Analysis
 
-![Speech Prediction](screenshots/speech model.png)
+![Speech Prediction](Screenshots/speech%20model.png)
 
 ## Dashboard
 
-![Dashboard](screenshots/dashboard.png)
+![Dashboard](Screenshots/dashboard.png)
 
 ## Patient Records
 
-![Patient Records](screenshots/Patient Records.png)
+![Patient Records](Screenshots/Patient%20Records.png)
