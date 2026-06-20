@@ -1,106 +1,3 @@
-# import torch
-# from transformers import AutoTokenizer, AutoModelForSequenceClassification
-# import json
-
-# model_path = r"C:\Users\mamdo\OneDrive\Documents\grad\model_only"
-
-# tokenizer = AutoTokenizer.from_pretrained(model_path)
-# model = AutoModelForSequenceClassification.from_pretrained(model_path)
-
-# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-# model.to(device)
-# model.eval()
-
-# try:
-#     with open(f"{model_path}/id2label.json") as f:
-#         id2label = json.load(f)
-# except:
-#     id2label = {str(i): f"Class {i}" for i in range(model.config.num_labels)}
-
-
-# def _get_probs(text: str):
-#     inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=128)
-#     if "token_type_ids" in inputs:
-#         inputs.pop("token_type_ids")
-#     inputs = {k: v.to(device) for k, v in inputs.items()}
-#     with torch.no_grad():
-#         outputs = model(**inputs)
-#     probs = torch.nn.functional.softmax(outputs.logits, dim=1)[0]
-#     return probs
-
-
-# def predict(text: str):
-#     """Returns (label, confidence) for the top prediction. Backwards compatible."""
-#     probs = _get_probs(text)
-#     pred_id = torch.argmax(probs).item()
-#     return id2label[str(pred_id)], float(probs[pred_id])
-
-
-# def predict_topk(text: str, k: int = None):
-#     """
-#     Returns all symptoms sorted by confidence descending.
-#     If k is given, returns only the top-k.
-#     Each item: {"rank": int, "label": str, "score": float}
-#     """
-#     probs = _get_probs(text)
-#     sorted_ids = torch.argsort(probs, descending=True)
-
-#     if k is not None:
-#         sorted_ids = sorted_ids[:k]
-
-#     results = []
-#     for rank, idx in enumerate(sorted_ids, 1):
-#         score = float(probs[idx])
-#         if rank > 1 and score < 0.001:
-#             break
-#         results.append({
-#             "rank":  rank,
-#             "label": id2label[str(idx.item())],
-#             "score": score,
-#         })
-
-#     return results
-
-
-# def debug(text: str):
-#     """
-#     Run from terminal to diagnose prediction issues:
-#         python -c "from model import debug; debug('I have a headache')"
-#     """
-#     inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=128)
-#     if "token_type_ids" in inputs:
-#         inputs.pop("token_type_ids")
-#     inputs = {k: v.to(device) for k, v in inputs.items()}
-
-#     with torch.no_grad():
-#         outputs = model(**inputs)
-
-#     logits = outputs.logits[0]
-#     probs  = torch.nn.functional.softmax(logits, dim=0)
-
-#     print(f"\n── Input ──────────────────────────────")
-#     print(f"  Text: '{text}'")
-#     print(f"\n── Logits (raw) ───────────────────────")
-#     print(f"  min={logits.min():.4f}  max={logits.max():.4f}  std={logits.std():.4f}")
-
-#     print(f"\n── Top 10 predictions ─────────────────")
-#     top_ids = torch.argsort(probs, descending=True)[:10]
-#     for rank, idx in enumerate(top_ids, 1):
-#         i = idx.item()
-#         label = id2label.get(str(i), f"[MISSING id {i}]")
-#         print(f"  {rank:>2}. {label:<40s}  {probs[i]*100:6.2f}%")
-
-#     print(f"\n── id2label check ─────────────────────")
-#     print(f"  id2label entries : {len(id2label)}")
-#     print(f"  model num_labels : {model.config.num_labels}")
-#     missing = [str(i) for i in range(model.config.num_labels) if str(i) not in id2label]
-#     if missing:
-#         print(f"  ⚠️  Missing keys in id2label: {missing[:10]}")
-#     else:
-#         print(f"  ✅ All label IDs present in id2label.json")
-#     print()
-
-
 """
 model.py — SehaTrack Pro
 Unified inference engine:
@@ -110,10 +7,7 @@ Unified inference engine:
   ④ Grad-CAM++ explainability for CheXNet
   ⑤ LIME explainability for Kvasir
 
-All paths are relative — place your weight files next to this script:
-    model_only/           ← HuggingFace NLP model directory
-    best_chexnet_multimodal.pth
-    gi_model_clean.h5
+
 """
 
 import os
@@ -128,6 +22,7 @@ import torch.nn.functional as F
 from PIL import Image
 from torchvision.models import densenet121
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from huggingface_hub import hf_hub_download
 
 # ── Lazy TF import so the app still loads if TF is not installed ──────────────
 try:
@@ -149,9 +44,14 @@ except ImportError:
 # ══════════════════════════════════════════════════════════════════════════════
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
-NLP_MODEL_PATH   = os.path.join(_HERE, "model_only")
-VISION_WEIGHTS   = os.path.join(_HERE, "best_chexnet_multimodal.pth")
+NLP_MODEL_PATH    = os.path.join(_HERE, "model_only")
+VISION_WEIGHTS    = os.path.join(_HERE, "best_chexnet_multimodal.pth")
 KVASIR_MODEL_PATH = os.path.join(_HERE, "gi_model_clean.h5")
+
+# Weight files are too large to live in the git repo, so they're fetched on
+# first use instead, all from the Hugging Face Hub repos below.
+HF_WEIGHTS_REPO = "m1881/sehatrack-weights"   # holds the .pth and .h5
+HF_NLP_REPO     = "m1881/sehatrack-nlp"        # holds the model_only/ contents
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DEVICE = device
@@ -187,21 +87,41 @@ OPTIMAL_THRESHOLDS = {
 # ① NLP SYMPTOM ENGINE
 # ══════════════════════════════════════════════════════════════════════════════
 def _load_nlp():
-    if not os.path.isdir(NLP_MODEL_PATH):
-        return None, None
+    use_local = os.path.isdir(NLP_MODEL_PATH)
+    source    = NLP_MODEL_PATH if use_local else HF_NLP_REPO
+    # On the Hub, all the NLP files live inside a "model_only" subfolder of
+    # the repo rather than at the repo root, so from_pretrained needs to be
+    # told that explicitly. A local checkout already points straight at the
+    # right folder, so no subfolder is needed in that case.
+    subfolder = None if use_local else "model_only"
+
     try:
-        tok = AutoTokenizer.from_pretrained(NLP_MODEL_PATH)
-        mdl = AutoModelForSequenceClassification.from_pretrained(NLP_MODEL_PATH)
+        kwargs = {"subfolder": subfolder} if subfolder else {}
+
+        tok = AutoTokenizer.from_pretrained(source, **kwargs)
+        mdl = AutoModelForSequenceClassification.from_pretrained(source, **kwargs)
         mdl.to(device)
         mdl.eval()
 
         # Load id2label from JSON if not baked into config
-        id2label_path = os.path.join(NLP_MODEL_PATH, "id2label.json")
-        if os.path.isfile(id2label_path):
+        if use_local:
+            id2label_path = os.path.join(NLP_MODEL_PATH, "id2label.json")
+        else:
+            try:
+                id2label_path = hf_hub_download(
+                    repo_id=HF_NLP_REPO,
+                    filename="id2label.json",
+                    subfolder="model_only",
+                )
+            except Exception as e:
+                print(f"[NLP] Could not fetch id2label.json: {e}")
+                id2label_path = None
+
+        if id2label_path and os.path.isfile(id2label_path):
             with open(id2label_path) as f:
                 extra = json.load(f)
-            if not mdl.config.id2label:
-                mdl.config.id2label = {int(k): v for k, v in extra.items()}
+            mdl.config.id2label = {int(k): v for k, v in extra.items()}
+            mdl.config.label2id  = {v: int(k) for k, v in extra.items()}
 
         return tok, mdl
     except Exception as e:
@@ -209,25 +129,39 @@ def _load_nlp():
         return None, None
 
 
-_tokenizer, _nlp_model = _load_nlp()
+# Lazy singleton — the NLP model is only loaded into memory the first time
+# a prediction is actually requested, instead of at import time. This keeps
+# it from competing with the Whisper / CheXNet / Kvasir models for memory
+# the moment the app process starts (before anyone has even logged in).
+_tokenizer = None
+_nlp_model = None
+
+
+def _get_nlp():
+    global _tokenizer, _nlp_model
+    if _nlp_model is None and _tokenizer is None:
+        _tokenizer, _nlp_model = _load_nlp()
+    return _tokenizer, _nlp_model
 
 
 def _get_probs(text: str) -> torch.Tensor:
-    inputs = _tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
+    tok, mdl = _get_nlp()
+    inputs = tok(text, return_tensors="pt", truncation=True, max_length=512)
     inputs.pop("token_type_ids", None)
     inputs = {k: v.to(device) for k, v in inputs.items()}
     with torch.no_grad():
-        logits = _nlp_model(**inputs).logits
+        logits = mdl(**inputs).logits
     return F.softmax(logits, dim=1)[0]
 
 
 def predict(text: str) -> Tuple[str, float]:
     """Return (top_label, confidence) — backwards-compatible with original app.py."""
-    if _nlp_model is None or not text.strip():
+    tok, mdl = _get_nlp()
+    if mdl is None or not text.strip():
         return "Unknown Symptom", 0.0
     probs   = _get_probs(text)
     pred_id = torch.argmax(probs).item()
-    label   = _nlp_model.config.id2label.get(pred_id, f"Class {pred_id}")
+    label   = mdl.config.id2label.get(pred_id, f"Class {pred_id}")
     return str(label), float(probs[pred_id])
 
 
@@ -237,7 +171,8 @@ def predict_topk(text: str, k: Optional[int] = None) -> List[Dict[str, Any]]:
     If k is given, return only top-k.
     Each item: {"rank": int, "label": str, "score": float}
     """
-    if _nlp_model is None or not text.strip():
+    tok, mdl = _get_nlp()
+    if mdl is None or not text.strip():
         return [{"rank": 1, "label": "Unknown Symptom", "score": 0.0}]
 
     probs      = _get_probs(text)
@@ -252,7 +187,7 @@ def predict_topk(text: str, k: Optional[int] = None) -> List[Dict[str, Any]]:
             break
         results.append({
             "rank":  rank,
-            "label": str(_nlp_model.config.id2label.get(idx.item(), f"Class {idx.item()}")),
+            "label": str(mdl.config.id2label.get(idx.item(), f"Class {idx.item()}")),
             "score": score,
         })
     return results
@@ -260,7 +195,8 @@ def predict_topk(text: str, k: Optional[int] = None) -> List[Dict[str, Any]]:
 
 def debug_nlp(text: str) -> None:
     """CLI helper: python -c "from model import debug_nlp; debug_nlp('I have a headache')" """
-    if _nlp_model is None:
+    tok, mdl = _get_nlp()
+    if mdl is None:
         print("NLP model not loaded.")
         return
     probs   = _get_probs(text)
@@ -269,7 +205,7 @@ def debug_nlp(text: str) -> None:
     print(f"── Top 10 predictions ─────────────────")
     for rank, idx in enumerate(top_ids, 1):
         i     = idx.item()
-        label = _nlp_model.config.id2label.get(i, f"[MISSING {i}]")
+        label = mdl.config.id2label.get(i, f"[MISSING {i}]")
         print(f"  {rank:>2}. {label:<40s}  {probs[i]*100:6.2f}%")
     print()
 
@@ -286,15 +222,14 @@ def encode_meta(age: Any, gender: Any, view_pos: Any) -> torch.Tensor:
     g = 1.0 if str(gender).lower().strip() == "female" else 0.0
     v = 1.0 if "ap" in str(view_pos).lower() else 0.0
     return torch.tensor([[a, g, v]], dtype=torch.float32)
-
-
 class CheXNetMultimodal(nn.Module):
     def __init__(self, num_classes: int = 14, meta_dim: int = 3, dropout_rate: float = 0.4):
         super().__init__()
-        base            = densenet121(weights=None)
-        self.features   = base.features
-        self.avgpool    = nn.AdaptiveAvgPool2d((1, 1))
-        dense_out       = base.classifier.in_features
+        base          = densenet121(weights=None)
+        self.features = base.features
+        self.avgpool  = nn.AdaptiveAvgPool2d((1, 1))
+        dense_out     = base.classifier.in_features
+
 
         self.meta_branch = nn.Sequential(
             nn.Linear(meta_dim, 32), nn.ReLU(inplace=True),
@@ -302,33 +237,49 @@ class CheXNetMultimodal(nn.Module):
             nn.Linear(32, 16), nn.ReLU(inplace=True),
         )
 
-        fusion = dense_out + 16
         self.classifier = nn.Sequential(
-            nn.BatchNorm1d(fusion),
-            nn.Dropout(dropout_rate),
-            nn.Linear(fusion, 512), nn.ReLU(inplace=True),
-            nn.Dropout(dropout_rate / 2),
-            nn.Linear(512, num_classes),
+            nn.Linear(dense_out, num_classes),
         )
 
     def forward(self, img: torch.Tensor, meta: torch.Tensor) -> torch.Tensor:
         feats = F.relu(self.features(img), inplace=False)
         x     = torch.flatten(self.avgpool(feats), 1)
-        return self.classifier(torch.cat([x, self.meta_branch(meta)], dim=1))
+        return self.classifier(x)
+    
+    
+    
+def _resolve_vision_weights() -> Optional[str]:
+    """Use the local file if present; otherwise download it from the
+    Hugging Face Hub repo on first use (it isn't checked into git)."""
+    if os.path.isfile(VISION_WEIGHTS):
+        return VISION_WEIGHTS
+    try:
+        return hf_hub_download(repo_id=HF_WEIGHTS_REPO, filename="best_chexnet_multimodal.pth")
+    except Exception as e:
+        print(f"[CheXNet] Could not fetch weights from Hugging Face Hub: {e}")
+        return None
 
 
-def load_vision_engine(weights_path: str = VISION_WEIGHTS) -> CheXNetMultimodal:
+def load_vision_engine() -> CheXNetMultimodal:
     model = CheXNetMultimodal(num_classes=len(DISEASE_LABELS))
-    if os.path.isfile(weights_path):
+    weights_path = _resolve_vision_weights()
+    print(f"[CheXNet] Resolved weights path: {weights_path}")
+    if weights_path:
         try:
             ckpt  = torch.load(weights_path, map_location=device, weights_only=False)
+            print(f"[CheXNet] Checkpoint type: {type(ckpt)}, top-level keys: "
+                  f"{list(ckpt.keys()) if isinstance(ckpt, dict) else 'n/a'}")
             state = ckpt.get("model_state_dict") or ckpt.get("state_dict") or ckpt
             if isinstance(state, dict):
                 clean = {
-                    k.replace("module.", "").replace("base_model.", ""): v
+                    k.replace("module.", "").replace("base_model.", "").replace("model.", ""): v
                     for k, v in state.items()
                 }
-                model.load_state_dict(clean, strict=False)
+                result = model.load_state_dict(clean, strict=False)
+                total = len(model.state_dict())
+                print(f"[CheXNet] Matched {total - len(result.missing_keys)}/{total} parameter tensors")
+                print(f"[CheXNet] Missing (sample): {result.missing_keys[:8]}")
+                print(f"[CheXNet] Unexpected (sample): {result.unexpected_keys[:8]}")
         except Exception as e:
             print(f"[CheXNet] Error loading weights: {e}")
     model.to(device)
@@ -414,28 +365,30 @@ class GradCAMPlusPlus:
 # ══════════════════════════════════════════════════════════════════════════════
 # ④ KVASIR GI ENDOSCOPY ENGINE
 # ══════════════════════════════════════════════════════════════════════════════
+def _resolve_kvasir_weights() -> Optional[str]:
+    """Use the local file if present; otherwise download it from the
+    Hugging Face Hub repo on first use (it isn't checked into git)."""
+    if os.path.isfile(KVASIR_MODEL_PATH):
+        return KVASIR_MODEL_PATH
+    try:
+        return hf_hub_download(repo_id=HF_WEIGHTS_REPO, filename="gi_model_clean.h5")
+    except Exception as e:
+        print(f"[Kvasir] Could not fetch weights from Hugging Face Hub: {e}")
+        return None
+
+
 def load_kvasir_engine():
     if not _TF_AVAILABLE:
         return None
-    if os.path.isfile(KVASIR_MODEL_PATH):
+
+    weights_path = _resolve_kvasir_weights()
+    if weights_path:
         try:
-            return tf.keras.models.load_model(KVASIR_MODEL_PATH)
+            return tf.keras.models.load_model(weights_path)
         except Exception as e:
             print(f"[Kvasir] Failed to load saved model: {e}")
 
-    # Fallback: build untrained architecture
-    base = tf.keras.applications.EfficientNetB1(
-        input_shape=(224, 224, 3), include_top=False, weights=None
-    )
-    model = tf.keras.models.Sequential([
-        base,
-        tf.keras.layers.GlobalAveragePooling2D(),
-        tf.keras.layers.BatchNormalization(),
-        tf.keras.layers.Dense(256, activation="relu"),
-        tf.keras.layers.Dropout(0.4),
-        tf.keras.layers.Dense(len(GI_CLASSES), activation="softmax"),
-    ])
-    return model
+    return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -495,3 +448,4 @@ def run_kvasir_lime_explanation(
     ]
 
     return class_name, confidence, chart_data, boundary_img
+
