@@ -251,3 +251,30 @@ The application can be deployed using Streamlit Community Cloud:
 * Mobile application support.
 * Integration with healthcare information systems.
 * Multimodal AI fusion for improved diagnostic accuracy.
+
+---
+## Screenshots
+
+## Login Page
+
+![Login Page](screenshots/log-in.png)
+
+## Chest X-Ray Analysis
+
+![X-Ray Prediction](screenshots/xray_results.png)
+
+## GI Analysis
+
+![GI Prediction](screenshots/Gi_result.png)
+
+## Speech Analysis
+
+![Speech Prediction](screenshots/speech model.png)
+
+## Dashboard
+
+![Dashboard](screenshots/dashboard.png)
+
+## Patient Records
+
+![Patient Records](screenshots/Patient Records.png)
